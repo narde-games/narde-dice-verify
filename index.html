@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Narde dice check</title>
+<style>
+  :root { --bg: #fbfaf7; --fg: #1d1b16; --muted: #5f5a4f; --ok: #1f7a3a; --bad: #b3261e; --line: #d9d4c7; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16150f; --fg: #ece7da; --muted: #a8a294; --ok: #6fcf8a; --bad: #f2b8b5; --line: #3a372e; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 8px; }
+  p { color: var(--muted); }
+  textarea { width: 100%; box-sizing: border-box; min-height: 180px; font: 13px/1.4 ui-monospace, monospace;
+             background: transparent; color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+  input[type=text] { width: 100%; box-sizing: border-box; font: 13px ui-monospace, monospace; padding: 8px;
+                     background: transparent; color: var(--fg); border: 1px solid var(--line); border-radius: 8px; }
+  button { margin-top: 12px; font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--fg); color: var(--bg); cursor: pointer; }
+  label { display: block; margin-top: 16px; font-weight: 600; }
+  ol { padding-left: 0; list-style: none; font: 14px/1.6 ui-monospace, monospace; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  .summary { font-weight: 700; margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Narde dice check</h1>
+  <p>Checks every throw of a narde.games game against the seed revealed after it, with the
+  published formula <code>narde-hmac-sha256-v1</code>. Everything runs in this page; nothing is
+  sent anywhere — save the page and open it offline if you like.</p>
+
+  <label for="mat">The game's .mat file (Replay → download MAT)</label>
+  <input type="file" id="file" accept=".mat,text/plain">
+  <textarea id="mat" placeholder="…or paste the file here"></textarea>
+
+  <label for="seen">Fingerprint you noted when the game started (optional)</label>
+  <input type="text" id="seen" autocomplete="off" spellcheck="false">
+
+  <button id="run">Check</button>
+  <ol id="out" aria-live="polite"></ol>
+</main>
+<script>
+const FORMULA = 'narde-hmac-sha256-v1';
+const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+const unhex = (s) => new Uint8Array(s.match(/../g).map((h) => parseInt(h, 16)));
+// A big-endian number mod 6, byte by byte, with no 64-bit integer needed.
+const mod6 = (bytes) => bytes.reduce((r, b) => (r * 256 + b) % 6, 0);
+
+async function dice(key, message) {
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message)));
+  return [mod6(mac.slice(0, 8)) + 1, mod6(mac.slice(8, 16)) + 1];
+}
+
+function parseMat(text) {
+  const headers = {}, throws = [];
+  for (const line of text.split(/\r?\n/)) {
+    const h = line.match(/^;\s*\[([^"\]]+?)\s+"([^"]*)"\]/);
+    if (h) { headers[h[1]] = h[2]; continue; }
+    if (!/^\s*\d+\)/.test(line)) continue;
+    // A .mat row: "%3d) " then player 1's cell (28 wide), then player 2's.
+    for (const cell of [line.slice(5, 33), line.slice(33)]) {
+      const d = cell.match(/^\s*([1-6])([1-6]):/);
+      if (d) throws.push([+d[1], +d[2]]);
+    }
+  }
+  return { headers, throws };
+}
+
+async function check(text, seen) {
+  const lines = [];
+  let ok = true;
+  const verdict = (passed, what) => { ok = ok && passed; lines.push([passed, what]); };
+  const { headers, throws } = parseMat(text);
+  if (!headers['Dice Formula']) return { lines: [[false, 'This file carries no dice seed.']], ok: false };
+  if (headers['Dice Formula'] !== FORMULA) return { lines: [[false, 'Unknown formula ' + headers['Dice Formula']]], ok: false };
+
+  const seed = unhex(headers['Dice Seed']);
+  const fingerprint = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', seed)));
+  verdict(fingerprint === (headers['Dice Seed Hash'] || '').toLowerCase(), 'fingerprint: SHA-256(seed) = ' + fingerprint);
+  if (seen) verdict(fingerprint === seen.trim().toLowerCase(), 'matches the fingerprint you saw at the start');
+
+  const key = await crypto.subtle.importKey('raw', seed, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  let opening, k = 0;
+  for (; k < 1000; k++) { opening = await dice(key, 'open:' + k); if (opening[0] !== opening[1]) break; }
+  const shown = opening.join('-');
+  verdict(headers['Opening Roll'] === shown, `opening roll: open:${k} gives ${shown}, file says ${headers['Opening Roll']}`);
+
+  const carried = (headers['Opening Dice'] || 'carried') === 'carried';
+  for (let n = 1; n <= throws.length; n++) {
+    const t = throws[n - 1];
+    const expected = n === 1 && carried ? opening : await dice(key, 'turn:' + n);
+    const source = n === 1 && carried ? 'carried from the opening roll' : 'turn:' + n;
+    verdict(t[0] === expected[0] && t[1] === expected[1], `turn ${n}: ${t.join('-')} (${source} gives ${expected.join('-')})`);
+  }
+  return { lines, ok };
+}
+
+document.getElementById('file').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (f) document.getElementById('mat').value = await f.text();
+});
+document.getElementById('run').addEventListener('click', async () => {
+  const out = document.getElementById('out');
+  out.textContent = '';
+  try {
+    const { lines, ok } = await check(document.getElementById('mat').value, document.getElementById('seen').value);
+    for (const [passed, what] of lines) {
+      const li = document.createElement('li');
+      li.className = passed ? 'ok' : 'bad';
+      li.textContent = (passed ? '✓ ' : '✗ ') + what;
+      out.appendChild(li);
+    }
+    const s = document.createElement('li');
+    s.className = 'summary ' + (ok ? 'ok' : 'bad');
+    s.textContent = ok ? 'Every throw matches the seed.' : 'NOT every throw matches the seed.';
+    out.appendChild(s);
+  } catch (err) {
+    out.textContent = 'Could not read the file: ' + err.message;
+  }
+});
+</script>
+</body>
+</html>
